@@ -1,9 +1,10 @@
 """
-CAISO HASP LMP Pricing Dashboard - Yesterday HASP + Today HASP
-===============================================================
+CAISO HASP LMP Pricing Dashboard - Yesterday + Today
+=====================================================
 Fetches HASP 15-min LMP for ELAP_PACE-APND.
-Single /data endpoint fetches yesterday then today sequentially.
-One worker handles one long request, caches result, returns instantly after.
+Background thread fetches data and caches it.
+Browser polls /status every 10s until ready, then fetches /data instantly.
+Cache auto-expires at midnight PT so next day's data is always fresh.
 
 Requirements: requests, flask, gunicorn
 Start: gunicorn caiso_hasp:app --timeout 300
@@ -15,6 +16,7 @@ import sys
 import time
 import zipfile
 import traceback
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -29,7 +31,12 @@ TZ_UTC    = ZoneInfo("UTC")
 
 app = Flask(__name__)
 
-_cache = {"data": None, "fetching": False}
+_cache = {
+    "data":       None,
+    "fetching":   False,
+    "cache_date": None,
+}
+_lock = threading.Lock()
 
 @app.after_request
 def add_cors(response):
@@ -92,22 +99,7 @@ def fetch_hours(label, date_pt, num_hours):
     return all_rows
 
 
-@app.route("/refresh")
-def refresh():
-    _cache["data"]     = None
-    _cache["fetching"] = False
-    return jsonify({"ok": True})
-
-
-@app.route("/data")
-def data():
-    if _cache["data"] is not None:
-        return jsonify(_cache["data"])
-
-    if _cache["fetching"]:
-        return jsonify({"error": "still_loading"}), 503
-
-    _cache["fetching"] = True
+def do_fetch():
     try:
         now_pt      = datetime.now(tz=TZ_PT)
         yesterday   = (now_pt - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -117,15 +109,61 @@ def data():
         yest_rows  = fetch_hours("Yesterday", yesterday, 24)
         today_rows = fetch_hours("Today", today_pt, hours_today)
 
-        result = {"yesterday": yest_rows, "today": today_rows}
-        _cache["data"]     = result
-        _cache["fetching"] = False
-        return jsonify(result)
+        with _lock:
+            _cache["data"]       = {"yesterday": yest_rows, "today": today_rows}
+            _cache["fetching"]   = False
+            _cache["cache_date"] = datetime.now(tz=TZ_PT).strftime("%Y-%m-%d")
+        print("Cache ready!", flush=True)
     except Exception:
-        _cache["fetching"] = False
+        with _lock:
+            _cache["fetching"] = False
         traceback.print_exc(file=sys.stdout)
         sys.stdout.flush()
-        return jsonify({"error": "fetch_failed"}), 500
+
+
+def cache_is_stale():
+    today = datetime.now(tz=TZ_PT).strftime("%Y-%m-%d")
+    return _cache["cache_date"] != today
+
+
+def ensure_fetching():
+    with _lock:
+        if _cache["fetching"]:
+            return
+        if _cache["data"] is not None and not cache_is_stale():
+            return
+        _cache["fetching"] = True
+        _cache["data"]     = None
+    threading.Thread(target=do_fetch, daemon=True).start()
+
+
+@app.route("/invalidate")
+def invalidate():
+    with _lock:
+        _cache["data"]       = None
+        _cache["fetching"]   = False
+        _cache["cache_date"] = None
+    ensure_fetching()
+    return jsonify({"ok": True})
+
+
+@app.route("/status")
+def status():
+    ensure_fetching()
+    with _lock:
+        if _cache["fetching"]:
+            return jsonify({"ready": False})
+        if _cache["data"] is not None:
+            return jsonify({"ready": True})
+    return jsonify({"ready": False})
+
+
+@app.route("/data")
+def data():
+    with _lock:
+        if _cache["data"] is not None and not cache_is_stale():
+            return jsonify(_cache["data"])
+    return jsonify({"error": "not_ready"}), 503
 
 
 @app.route("/")
@@ -177,7 +215,7 @@ def dashboard():
     <h1>HASP 15-Min LMP - Today So Far | ELAP_PACE-APND</h1>
     <div class="meta" id="today-subtitle">Loading...</div>
   </div>
-  <div><button onclick="reload()" style="background:#fff;color:#7B68B5;border:none;padding:7px 14px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:13px;">Refresh</button></div>
+  <div><button onclick="forceRefresh()" style="background:#fff;color:#7B68B5;border:none;padding:7px 14px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:13px;">Refresh</button></div>
 </div>
 <div class="cards">
   <div class="card"><div class="label">Latest</div><div class="value" id="today-cLatest">-</div></div>
@@ -206,7 +244,7 @@ def dashboard():
   <div class="card"><div class="label">Off-Peak Avg</div><div class="value" id="yesterday-cOffPeak">-</div></div>
 </div>
 <div class="chart-wrap"><canvas id="yesterday-chart" height="180"></canvas></div>
-<div class="table-wrap"><div id="yesterday-table"><div class="status"><span class="spinner"></span> Waiting for today's data to finish first...</div></div></div>
+<div class="table-wrap"><div id="yesterday-table"><div class="status"><span class="spinner"></span> Waiting for fetch to complete...</div></div></div>
 
 <script>
 var charts    = {};
@@ -302,34 +340,39 @@ function renderSection(prefix, rows, isToday) {
   document.getElementById(prefix + "-table").innerHTML = tbl;
 }
 
-function reload() {
+function pollUntilReady() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-  document.getElementById("today-subtitle").textContent = "Fetching...";
-  document.getElementById("yesterday-subtitle").textContent = "Waiting...";
-  document.getElementById("today-table").innerHTML = '<div class="status"><span class="spinner"></span> Fetching HASP data from CAISO... please wait (~3 min).</div>';
-  document.getElementById("yesterday-table").innerHTML = '<div class="status"><span class="spinner"></span> Waiting for today\'s data to finish first...</div>';
-
-  // Clear server cache first, then fetch fresh data
-  fetch("/refresh")
-    .then(function() { return fetch("/data"); })
-    .then(function(resp) {
-      return resp.json().then(function(d) { return {status: resp.status, data: d}; });
-    })
-    .then(function(result) {
-      if (result.status === 503) {
-        document.getElementById("today-subtitle").textContent = "Fetching from CAISO... checking again in 15s";
-        pollTimer = setTimeout(reload, 15000);
+  fetch("/status")
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      if (!s.ready) {
+        document.getElementById("today-subtitle").textContent = "Fetching from CAISO... checking again in 10s";
+        pollTimer = setTimeout(pollUntilReady, 10000);
         return;
       }
-      renderSection("today",     result.data.today,     true);
-      renderSection("yesterday", result.data.yesterday, false);
+      fetch("/data")
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          renderSection("today",     d.today,     true);
+          renderSection("yesterday", d.yesterday, false);
+        });
     })
     .catch(function(e) {
-      document.getElementById("today-table").innerHTML = '<div class="status">Error: ' + e.message + ' <button onclick="reload()">Retry</button></div>';
+      document.getElementById("today-table").innerHTML = '<div class="status">Error: ' + e.message + ' <button onclick="pollUntilReady()">Retry</button></div>';
     });
 }
 
-document.addEventListener("DOMContentLoaded", reload);
+function forceRefresh() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  document.getElementById("today-subtitle").textContent = "Requesting fresh data...";
+  document.getElementById("yesterday-subtitle").textContent = "Waiting...";
+  document.getElementById("today-table").innerHTML = '<div class="status"><span class="spinner"></span> Fetching fresh HASP data from CAISO... please wait (~3 min).</div>';
+  document.getElementById("yesterday-table").innerHTML = '<div class="status"><span class="spinner"></span> Waiting for fetch to complete...</div>';
+  fetch("/invalidate")
+    .then(function() { pollUntilReady(); });
+}
+
+document.addEventListener("DOMContentLoaded", pollUntilReady);
 </script>
 </body>
 </html>"""
