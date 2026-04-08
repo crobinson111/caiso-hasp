@@ -92,6 +92,13 @@ def fetch_hours(label, date_pt, num_hours):
     return all_rows
 
 
+@app.route("/refresh")
+def refresh():
+    _cache["data"]     = None
+    _cache["fetching"] = False
+    return jsonify({"ok": True})
+
+
 @app.route("/data")
 def data():
     if _cache["data"] is not None:
@@ -299,8 +306,12 @@ function reload() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   document.getElementById("today-subtitle").textContent = "Fetching...";
   document.getElementById("yesterday-subtitle").textContent = "Waiting...";
+  document.getElementById("today-table").innerHTML = '<div class="status"><span class="spinner"></span> Fetching HASP data from CAISO... please wait (~3 min).</div>';
+  document.getElementById("yesterday-table").innerHTML = '<div class="status"><span class="spinner"></span> Waiting for today\'s data to finish first...</div>';
 
-  fetch("/data")
+  // Clear server cache first, then fetch fresh data
+  fetch("/refresh")
+    .then(function() { return fetch("/data"); })
     .then(function(resp) {
       return resp.json().then(function(d) { return {status: resp.status, data: d}; });
     })
