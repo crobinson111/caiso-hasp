@@ -99,6 +99,7 @@ def fetch_hours(label, date_pt, num_hours):
 def do_fetch_yesterday():
     print("do_fetch_yesterday started", flush=True)
     try:
+        print("do_fetch_yesterday inside try", flush=True)
         now_pt    = datetime.now(tz=TZ_PT)
         yesterday = (now_pt - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         rows      = fetch_hours("Yesterday", yesterday, 24)
@@ -117,6 +118,7 @@ def do_fetch_yesterday():
 def do_fetch_today():
     print("do_fetch_today started", flush=True)
     try:
+        print("do_fetch_today inside try", flush=True)
         now_pt   = datetime.now(tz=TZ_PT)
         today_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
         hours    = now_pt.hour
@@ -407,6 +409,7 @@ function pollSection(prefix, isToday) {
   var dataUrl    = "/data/" + prefix;
   var subtitleId = prefix + "-subtitle";
   var tableId    = prefix + "-table";
+  var retryBtn   = isToday ? '<button onclick="pollSection(\'today\',true)">Retry</button>' : '<button onclick="pollSection(\'yesterday\',false)">Retry</button>';
 
   fetch(statusUrl)
     .then(function(r) { return r.json(); })
@@ -425,7 +428,7 @@ function pollSection(prefix, isToday) {
         .then(function(d) { renderSection(prefix, d, isToday); });
     })
     .catch(function(e) {
-      document.getElementById(tableId).innerHTML = '<div class="status">Error: ' + e.message + ' <button onclick="pollSection(\'' + prefix + '\',' + isToday + ')">Retry</button></div>';
+      document.getElementById(tableId).innerHTML = '<div class="status">Error: ' + e.message + ' ' + retryBtn + '</div>';
     });
 }
 
