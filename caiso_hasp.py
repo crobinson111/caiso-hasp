@@ -2,9 +2,9 @@
 CAISO HASP LMP Pricing Dashboard - Yesterday + Today
 =====================================================
 Fetches HASP 15-min LMP for ELAP_PACE-APND.
-Background thread fetches data and caches it.
-Browser polls /status every 10s until ready, then fetches /data instantly.
-Cache auto-expires at midnight PT so next day's data is always fresh.
+Yesterday and Today are cached separately.
+Refresh button only re-fetches today's data.
+Yesterday is fetched once on first page load and never changes.
 
 Requirements: requests, flask, gunicorn
 Start: gunicorn caiso_hasp:app --timeout 300
@@ -31,12 +31,9 @@ TZ_UTC    = ZoneInfo("UTC")
 
 app = Flask(__name__)
 
-_cache = {
-    "data":       None,
-    "fetching":   False,
-    "cache_date": None,
-}
-_lock = threading.Lock()
+_yesterday = {"data": None, "fetching": False, "cache_date": None}
+_today     = {"data": None, "fetching": False, "cache_date": None}
+_lock      = threading.Lock()
 
 @app.after_request
 def add_cors(response):
@@ -99,71 +96,136 @@ def fetch_hours(label, date_pt, num_hours):
     return all_rows
 
 
-def do_fetch():
+def do_fetch_yesterday():
+    print("do_fetch_yesterday started", flush=True)
     try:
-        now_pt      = datetime.now(tz=TZ_PT)
-        yesterday   = (now_pt - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        today_pt    = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
-        hours_today = now_pt.hour
-
-        yest_rows  = fetch_hours("Yesterday", yesterday, 24)
-        today_rows = fetch_hours("Today", today_pt, hours_today)
-
+        now_pt    = datetime.now(tz=TZ_PT)
+        yesterday = (now_pt - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        rows      = fetch_hours("Yesterday", yesterday, 24)
         with _lock:
-            _cache["data"]       = {"yesterday": yest_rows, "today": today_rows}
-            _cache["fetching"]   = False
-            _cache["cache_date"] = datetime.now(tz=TZ_PT).strftime("%Y-%m-%d")
-        print("Cache ready!", flush=True)
+            _yesterday["data"]       = rows
+            _yesterday["fetching"]   = False
+            _yesterday["cache_date"] = now_pt.strftime("%Y-%m-%d")
+        print("Yesterday cache ready!", flush=True)
     except Exception:
         with _lock:
-            _cache["fetching"] = False
+            _yesterday["fetching"] = False
         traceback.print_exc(file=sys.stdout)
         sys.stdout.flush()
 
 
-def cache_is_stale():
+def do_fetch_today():
+    print("do_fetch_today started", flush=True)
+    try:
+        now_pt   = datetime.now(tz=TZ_PT)
+        today_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
+        hours    = now_pt.hour
+        rows     = fetch_hours("Today", today_pt, hours)
+        with _lock:
+            _today["data"]       = rows
+            _today["fetching"]   = False
+            _today["cache_date"] = now_pt.strftime("%Y-%m-%d")
+        print("Today cache ready!", flush=True)
+    except Exception:
+        with _lock:
+            _today["fetching"] = False
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+
+
+def is_stale(cache):
     today = datetime.now(tz=TZ_PT).strftime("%Y-%m-%d")
-    return _cache["cache_date"] != today
+    return cache["cache_date"] != today
 
 
-def ensure_fetching():
+def ensure_yesterday():
     with _lock:
-        if _cache["fetching"]:
+        if _yesterday["fetching"]:
             return
-        if _cache["data"] is not None and not cache_is_stale():
+        if _yesterday["data"] is not None and not is_stale(_yesterday):
             return
-        _cache["fetching"] = True
-        _cache["data"]     = None
-    threading.Thread(target=do_fetch, daemon=True).start()
+        _yesterday["fetching"] = True
+        _yesterday["data"]     = None
+    print("Starting yesterday fetch thread...", flush=True)
+    threading.Thread(target=do_fetch_yesterday, daemon=True).start()
 
 
-@app.route("/invalidate")
-def invalidate():
+def ensure_today():
     with _lock:
-        _cache["data"]       = None
-        _cache["fetching"]   = False
-        _cache["cache_date"] = None
-    ensure_fetching()
-    return jsonify({"ok": True})
+        if _today["fetching"]:
+            return
+        if _today["data"] is not None and not is_stale(_today):
+            return
+        _today["fetching"] = True
+        _today["data"]     = None
+    print("Starting today fetch thread...", flush=True)
+    threading.Thread(target=do_fetch_today, daemon=True).start()
 
 
-@app.route("/status")
-def status():
-    ensure_fetching()
+# ── Hourly auto-refresh (staggered 5 min after RTM) ──────────────────────────
+
+def hourly_refresh_loop():
+    """Auto-refresh today's cache at 5 minutes past each hour."""
+    while True:
+        now_pt    = datetime.now(tz=TZ_PT)
+        next_run  = now_pt.replace(minute=5, second=0, microsecond=0)
+        if next_run <= now_pt:
+            next_run += timedelta(hours=1)
+        sleep_sec = (next_run - now_pt).total_seconds()
+        print("  [Auto-refresh] Next today refresh in " + str(int(sleep_sec)) + "s", flush=True)
+        time.sleep(sleep_sec)
+        print("  [Auto-refresh] Triggering today refresh...", flush=True)
+        with _lock:
+            _today["data"]       = None
+            _today["fetching"]   = False
+            _today["cache_date"] = None
+        ensure_today()
+
+threading.Thread(target=hourly_refresh_loop, daemon=True).start()
+
+
+# ── API Routes ────────────────────────────────────────────────────────────────
+
+@app.route("/status/yesterday")
+def status_yesterday():
+    ensure_yesterday()
     with _lock:
-        if _cache["fetching"]:
-            return jsonify({"ready": False})
-        if _cache["data"] is not None:
-            return jsonify({"ready": True})
-    return jsonify({"ready": False})
+        ready = _yesterday["data"] is not None and not is_stale(_yesterday)
+    return jsonify({"ready": ready})
 
 
-@app.route("/data")
-def data():
+@app.route("/status/today")
+def status_today():
+    ensure_today()
     with _lock:
-        if _cache["data"] is not None and not cache_is_stale():
-            return jsonify(_cache["data"])
+        ready = _today["data"] is not None and not is_stale(_today)
+    return jsonify({"ready": ready})
+
+
+@app.route("/data/yesterday")
+def data_yesterday():
+    with _lock:
+        if _yesterday["data"] is not None and not is_stale(_yesterday):
+            return jsonify(_yesterday["data"])
     return jsonify({"error": "not_ready"}), 503
+
+
+@app.route("/data/today")
+def data_today():
+    with _lock:
+        if _today["data"] is not None and not is_stale(_today):
+            return jsonify(_today["data"])
+    return jsonify({"error": "not_ready"}), 503
+
+
+@app.route("/invalidate/today")
+def invalidate_today():
+    with _lock:
+        _today["data"]       = None
+        _today["fetching"]   = False
+        _today["cache_date"] = None
+    ensure_today()
+    return jsonify({"ok": True})
 
 
 @app.route("/")
@@ -215,7 +277,7 @@ def dashboard():
     <h1>HASP 15-Min LMP - Today So Far | ELAP_PACE-APND</h1>
     <div class="meta" id="today-subtitle">Loading...</div>
   </div>
-  <div><button onclick="forceRefresh()" style="background:#fff;color:#7B68B5;border:none;padding:7px 14px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:13px;">Refresh</button></div>
+  <div><button onclick="refreshToday()" style="background:#fff;color:#7B68B5;border:none;padding:7px 14px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:13px;">Refresh</button></div>
 </div>
 <div class="cards">
   <div class="card"><div class="label">Latest</div><div class="value" id="today-cLatest">-</div></div>
@@ -225,7 +287,7 @@ def dashboard():
   <div class="card"><div class="label">Hours</div><div class="value" id="today-cHours">-</div></div>
 </div>
 <div class="chart-wrap"><canvas id="today-chart" height="180"></canvas></div>
-<div class="table-wrap"><div id="today-table"><div class="status"><span class="spinner"></span> Fetching HASP data from CAISO... please wait (~3 min on first load).</div></div></div>
+<div class="table-wrap"><div id="today-table"><div class="status"><span class="spinner"></span> Fetching today's HASP data from CAISO...</div></div></div>
 
 <div class="divider"></div>
 
@@ -244,11 +306,12 @@ def dashboard():
   <div class="card"><div class="label">Off-Peak Avg</div><div class="value" id="yesterday-cOffPeak">-</div></div>
 </div>
 <div class="chart-wrap"><canvas id="yesterday-chart" height="180"></canvas></div>
-<div class="table-wrap"><div id="yesterday-table"><div class="status"><span class="spinner"></span> Waiting for fetch to complete...</div></div></div>
+<div class="table-wrap"><div id="yesterday-table"><div class="status"><span class="spinner"></span> Fetching yesterday's HASP data from CAISO...</div></div></div>
 
 <script>
 var charts    = {};
-var pollTimer = null;
+var pollToday = null;
+var pollYest  = null;
 
 function nowPT() {
   return new Date(new Date().toLocaleString("en-US", {timeZone:"America/Los_Angeles"}));
@@ -267,7 +330,6 @@ function renderSection(prefix, rows, isToday) {
     document.getElementById(prefix + "-table").innerHTML = '<div class="status">No data returned.</div>';
     return;
   }
-
   var sorted = rows.map(function(r) {
     return {
       time:   r["INTERVALSTARTTIME_GMT"],
@@ -340,39 +402,56 @@ function renderSection(prefix, rows, isToday) {
   document.getElementById(prefix + "-table").innerHTML = tbl;
 }
 
-function pollUntilReady() {
-  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-  fetch("/status")
+function pollSection(prefix, isToday) {
+  var statusUrl  = "/status/" + prefix;
+  var dataUrl    = "/data/" + prefix;
+  var subtitleId = prefix + "-subtitle";
+  var tableId    = prefix + "-table";
+
+  fetch(statusUrl)
     .then(function(r) { return r.json(); })
     .then(function(s) {
       if (!s.ready) {
-        document.getElementById("today-subtitle").textContent = "Fetching from CAISO... checking again in 10s";
-        pollTimer = setTimeout(pollUntilReady, 10000);
+        document.getElementById(subtitleId).textContent = "Fetching from CAISO... checking again in 10s";
+        if (isToday) {
+          pollToday = setTimeout(function() { pollSection("today", true); }, 10000);
+        } else {
+          pollYest  = setTimeout(function() { pollSection("yesterday", false); }, 10000);
+        }
         return;
       }
-      fetch("/data")
+      fetch(dataUrl)
         .then(function(r) { return r.json(); })
-        .then(function(d) {
-          renderSection("today",     d.today,     true);
-          renderSection("yesterday", d.yesterday, false);
-        });
+        .then(function(d) { renderSection(prefix, d, isToday); });
     })
     .catch(function(e) {
-      document.getElementById("today-table").innerHTML = '<div class="status">Error: ' + e.message + ' <button onclick="pollUntilReady()">Retry</button></div>';
+      document.getElementById(tableId).innerHTML = '<div class="status">Error: ' + e.message + ' <button onclick="pollSection(\'' + prefix + '\',' + isToday + ')">Retry</button></div>';
     });
 }
 
-function forceRefresh() {
-  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+function refreshToday() {
+  if (pollToday) { clearTimeout(pollToday); pollToday = null; }
   document.getElementById("today-subtitle").textContent = "Requesting fresh data...";
-  document.getElementById("yesterday-subtitle").textContent = "Waiting...";
-  document.getElementById("today-table").innerHTML = '<div class="status"><span class="spinner"></span> Fetching fresh HASP data from CAISO... please wait (~3 min).</div>';
-  document.getElementById("yesterday-table").innerHTML = '<div class="status"><span class="spinner"></span> Waiting for fetch to complete...</div>';
-  fetch("/invalidate")
-    .then(function() { pollUntilReady(); });
+  document.getElementById("today-table").innerHTML = '<div class="status"><span class="spinner"></span> Fetching fresh HASP data from CAISO... please wait (~2 min).</div>';
+  fetch("/invalidate/today")
+    .then(function() { pollSection("today", true); });
 }
 
-document.addEventListener("DOMContentLoaded", pollUntilReady);
+function scheduleClientRefresh() {
+  var now  = nowPT();
+  var next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()+1, 7, 0);
+  var wait = next - now;
+  setTimeout(function() {
+    pollSection("today", true);
+    scheduleClientRefresh();
+  }, wait);
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  pollSection("today",     true);
+  pollSection("yesterday", false);
+  scheduleClientRefresh();
+});
 </script>
 </body>
 </html>"""
