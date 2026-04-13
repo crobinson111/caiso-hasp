@@ -409,7 +409,6 @@ function pollSection(prefix, isToday) {
   var dataUrl    = "/data/" + prefix;
   var subtitleId = prefix + "-subtitle";
   var tableId    = prefix + "-table";
-  var retryBtn   = isToday ? '<button onclick="pollSection(\'today\',true)">Retry</button>' : '<button onclick="pollSection(\'yesterday\',false)">Retry</button>';
 
   fetch(statusUrl)
     .then(function(r) { return r.json(); })
@@ -428,7 +427,7 @@ function pollSection(prefix, isToday) {
         .then(function(d) { renderSection(prefix, d, isToday); });
     })
     .catch(function(e) {
-      document.getElementById(tableId).innerHTML = '<div class="status">Error: ' + e.message + ' ' + retryBtn + '</div>';
+      document.getElementById(tableId).innerHTML = '<div class="status">Error: ' + e.message + ' - Please refresh the page.</div>';
     });
 }
 
