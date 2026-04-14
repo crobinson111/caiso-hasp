@@ -119,6 +119,14 @@ def do_fetch_today():
     print("do_fetch_today started", flush=True)
     try:
         print("do_fetch_today inside try", flush=True)
+        # Wait for yesterday to finish first to avoid CAISO rate limiting
+        while True:
+            with _lock:
+                yest_done = _yesterday["fetching"] is False
+            if yest_done:
+                break
+            print("  do_fetch_today: waiting for yesterday to finish...", flush=True)
+            time.sleep(15)
         now_pt   = datetime.now(tz=TZ_PT)
         today_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
         hours    = now_pt.hour
