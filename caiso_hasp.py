@@ -122,6 +122,11 @@ def do_fetch_today():
         now_pt   = datetime.now(tz=TZ_PT)
         today_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
         hours    = now_pt.hour
+        if hours == 0:
+            print("do_fetch_today: no hours yet, skipping", flush=True)
+            with _lock:
+                _today["fetching"] = False
+            return
         rows     = fetch_hours("Today", today_pt, hours)
         with _lock:
             _today["data"]       = rows
@@ -192,7 +197,7 @@ threading.Thread(target=hourly_refresh_loop, daemon=True).start()
 def status_yesterday():
     ensure_yesterday()
     with _lock:
-        ready = _yesterday["data"] is not None and not is_stale(_yesterday)
+        ready = bool(_yesterday["data"]) and not is_stale(_yesterday)
     return jsonify({"ready": ready})
 
 
@@ -200,14 +205,14 @@ def status_yesterday():
 def status_today():
     ensure_today()
     with _lock:
-        ready = _today["data"] is not None and not is_stale(_today)
+        ready = bool(_today["data"]) and not is_stale(_today)
     return jsonify({"ready": ready})
 
 
 @app.route("/data/yesterday")
 def data_yesterday():
     with _lock:
-        if _yesterday["data"] is not None and not is_stale(_yesterday):
+        if bool(_yesterday["data"]) and not is_stale(_yesterday):
             return jsonify(_yesterday["data"])
     return jsonify({"error": "not_ready"}), 503
 
@@ -215,7 +220,7 @@ def data_yesterday():
 @app.route("/data/today")
 def data_today():
     with _lock:
-        if _today["data"] is not None and not is_stale(_today):
+        if bool(_today["data"]) and not is_stale(_today):
             return jsonify(_today["data"])
     return jsonify({"error": "not_ready"}), 503
 
