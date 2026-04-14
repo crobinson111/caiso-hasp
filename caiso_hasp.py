@@ -174,19 +174,25 @@ def ensure_today():
 def hourly_refresh_loop():
     """Auto-refresh today's cache at 5 minutes past each hour."""
     while True:
-        now_pt    = datetime.now(tz=TZ_PT)
-        next_run  = now_pt.replace(minute=5, second=0, microsecond=0)
-        if next_run <= now_pt:
-            next_run += timedelta(hours=1)
-        sleep_sec = (next_run - now_pt).total_seconds()
-        print("  [Auto-refresh] Next today refresh in " + str(int(sleep_sec)) + "s", flush=True)
-        time.sleep(sleep_sec)
-        print("  [Auto-refresh] Triggering today refresh...", flush=True)
-        with _lock:
-            _today["data"]       = None
-            _today["fetching"]   = False
-            _today["cache_date"] = None
-        ensure_today()
+        try:
+            now_pt    = datetime.now(tz=TZ_PT)
+            next_run  = now_pt.replace(minute=5, second=0, microsecond=0)
+            if next_run <= now_pt:
+                next_run += timedelta(hours=1)
+            sleep_sec = (next_run - now_pt).total_seconds()
+            print("  [Auto-refresh] Next today refresh in " + str(int(sleep_sec)) + "s", flush=True)
+            time.sleep(sleep_sec)
+            print("  [Auto-refresh] Triggering today refresh...", flush=True)
+            with _lock:
+                _today["data"]       = None
+                _today["fetching"]   = False
+                _today["cache_date"] = None
+            ensure_today()
+        except Exception:
+            print("  [Auto-refresh] ERROR in refresh loop:", flush=True)
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+            time.sleep(60)  # wait a minute before retrying
 
 threading.Thread(target=hourly_refresh_loop, daemon=True).start()
 
