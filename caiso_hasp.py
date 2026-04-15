@@ -119,14 +119,6 @@ def do_fetch_today():
     print("do_fetch_today started", flush=True)
     try:
         print("do_fetch_today inside try", flush=True)
-        # Wait for yesterday to finish first to avoid CAISO rate limiting
-        while True:
-            with _lock:
-                yest_done = _yesterday["fetching"] is False
-            if yest_done:
-                break
-            print("  do_fetch_today: waiting for yesterday to finish...", flush=True)
-            time.sleep(15)
         now_pt   = datetime.now(tz=TZ_PT)
         today_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
         hours    = now_pt.hour
@@ -157,7 +149,7 @@ def ensure_yesterday():
     with _lock:
         if _yesterday["fetching"]:
             return
-        if _yesterday["data"] is not None and not is_stale(_yesterday):
+        if bool(_yesterday["data"]) and not is_stale(_yesterday):
             return
         _yesterday["fetching"] = True
         _yesterday["data"]     = None
@@ -169,7 +161,10 @@ def ensure_today():
     with _lock:
         if _today["fetching"]:
             return
-        if _today["data"] is not None and not is_stale(_today):
+        if bool(_today["data"]) and not is_stale(_today):
+            return
+        # Only start today's fetch if yesterday is already done
+        if not bool(_yesterday["data"]) or is_stale(_yesterday):
             return
         _today["fetching"] = True
         _today["data"]     = None
@@ -217,7 +212,8 @@ def status_yesterday():
 
 @app.route("/status/today")
 def status_today():
-    ensure_today()
+    ensure_yesterday()  # always ensure yesterday first
+    ensure_today()      # today only starts if yesterday is ready
     with _lock:
         ready = bool(_today["data"]) and not is_stale(_today)
     return jsonify({"ready": ready})
@@ -245,6 +241,7 @@ def invalidate_today():
         _today["data"]       = None
         _today["fetching"]   = False
         _today["cache_date"] = None
+    ensure_yesterday()
     ensure_today()
     return jsonify({"ok": True})
 
@@ -458,20 +455,18 @@ function refreshToday() {
     .then(function() { pollSection("today", true); });
 }
 
-function scheduleClientRefresh() {
-  var now  = nowPT();
-  var next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()+1, 7, 0);
-  var wait = next - now;
-  setTimeout(function() {
-    pollSection("today", true);
-    scheduleClientRefresh();
-  }, wait);
-}
+// Poll for new today data every 5 minutes
+setInterval(function() {
+  fetch("/data/today")
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d && d.length) { renderSection("today", d, true); }
+    });
+}, 300000);
 
 document.addEventListener("DOMContentLoaded", function() {
   pollSection("today",     true);
   pollSection("yesterday", false);
-  scheduleClientRefresh();
 });
 </script>
 </body>
